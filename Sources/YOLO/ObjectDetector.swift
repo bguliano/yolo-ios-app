@@ -33,7 +33,7 @@ public class ObjectDetector: BasePredictor, @unchecked Sendable {
   /// the Vision model's feature provider is also updated to use the new value.
   ///
   /// - Parameter confidence: The new confidence threshold value (0.0 to 1.0).
-  override func setConfidenceThreshold(confidence: Double) {
+  override public func setConfidenceThreshold(confidence: Double) {
     confidenceThreshold = confidence
     detector?.featureProvider = ThresholdProvider(
       iouThreshold: iouThreshold, confidenceThreshold: confidenceThreshold)
@@ -45,7 +45,7 @@ public class ObjectDetector: BasePredictor, @unchecked Sendable {
   /// the Vision model's feature provider is also updated to use the new value.
   ///
   /// - Parameter iou: The new IoU threshold value (0.0 to 1.0).
-  override func setIouThreshold(iou: Double) {
+  override public func setIouThreshold(iou: Double) {
     iouThreshold = iou
     detector?.featureProvider = ThresholdProvider(
       iouThreshold: iouThreshold, confidenceThreshold: confidenceThreshold)
