@@ -267,7 +267,7 @@ public class BasePredictor: Predictor, @unchecked Sendable {
   /// Sets the confidence threshold for filtering results.
   ///
   /// - Parameter confidence: The new confidence threshold value (0.0 to 1.0).
-  func setConfidenceThreshold(confidence: Double) {
+  public func setConfidenceThreshold(confidence: Double) {
     confidenceThreshold = confidence
     let iou = requiresNMS ? iouThreshold : 1.0
     detector?.featureProvider = ThresholdProvider(
@@ -282,7 +282,7 @@ public class BasePredictor: Predictor, @unchecked Sendable {
   /// Sets the IoU threshold for non-maximum suppression.
   ///
   /// - Parameter iou: The new IoU threshold value (0.0 to 1.0).
-  func setIouThreshold(iou: Double) {
+  public func setIouThreshold(iou: Double) {
     iouThreshold = iou
     let effectiveIou = requiresNMS ? iouThreshold : 1.0
     detector?.featureProvider = ThresholdProvider(
@@ -297,7 +297,7 @@ public class BasePredictor: Predictor, @unchecked Sendable {
   /// Sets the maximum number of detection items to include in results.
   ///
   /// - Parameter numItems: The maximum number of items to include.
-  func setNumItemsThreshold(numItems: Int) {
+  public func setNumItemsThreshold(numItems: Int) {
     numItemsThreshold = numItems
   }
 

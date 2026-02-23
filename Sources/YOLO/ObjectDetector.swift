@@ -28,6 +28,30 @@ import Vision
 /// - SeeAlso: `Segmenter` for models that produce pixel-level masks for objects.
 public class ObjectDetector: BasePredictor, @unchecked Sendable {
 
+  /// Sets the confidence threshold and updates the model's feature provider.
+  ///
+  /// This overridden method ensures that when the confidence threshold is changed,
+  /// the Vision model's feature provider is also updated to use the new value.
+  ///
+  /// - Parameter confidence: The new confidence threshold value (0.0 to 1.0).
+  override public func setConfidenceThreshold(confidence: Double) {
+    confidenceThreshold = confidence
+    detector?.featureProvider = ThresholdProvider(
+      iouThreshold: iouThreshold, confidenceThreshold: confidenceThreshold)
+  }
+
+  /// Sets the IoU threshold and updates the model's feature provider.
+  ///
+  /// This overridden method ensures that when the IoU threshold is changed,
+  /// the Vision model's feature provider is also updated to use the new value.
+  ///
+  /// - Parameter iou: The new IoU threshold value (0.0 to 1.0).
+  override public func setIouThreshold(iou: Double) {
+    iouThreshold = iou
+    detector?.featureProvider = ThresholdProvider(
+      iouThreshold: iouThreshold, confidenceThreshold: confidenceThreshold)
+  }
+
   /// Processes the results from the Vision framework's object detection request.
   ///
   /// This method extracts bounding boxes, class labels, and confidence scores from the

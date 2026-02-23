@@ -17,7 +17,7 @@ import UIKit
 
 /// The primary interface for working with YOLO models, supporting multiple input types and inference methods.
 public class YOLO: @unchecked Sendable {
-  var predictor: Predictor?
+  public var predictor: Predictor?
 
   private var pendingNumItems: Int?
   private var pendingConfidence: Double?
