@@ -20,11 +20,9 @@ import Vision
 
 /// Specialized predictor for YOLO segmentation models that identify objects and their pixel-level masks.
 public class Segmenter: BasePredictor, @unchecked Sendable {
-  var colorsForMask: [(red: UInt8, green: UInt8, blue: UInt8)] = []
 
   override func processObservations(for request: VNRequest, error: Error?) {
     if let results = request.results as? [VNCoreMLFeatureValueObservation] {
-      //            DispatchQueue.main.async { [self] in
       guard results.count == 2 else { return }
       var pred: MLMultiArray
       var masks: MLMultiArray
@@ -67,6 +65,7 @@ public class Segmenter: BasePredictor, @unchecked Sendable {
           width: box.width / modelWidth, height: box.height / modelHeight)
         let confidence = p.2
         let bestClass = p.1
+        guard bestClass < self.labels.count else { continue }
         let label = self.labels[bestClass]
         let xywh = VNImageRectForNormalizedRect(rect, inputWidth, inputHeight)
 
@@ -75,6 +74,9 @@ public class Segmenter: BasePredictor, @unchecked Sendable {
         boxes.append(boxResult)
         alphas.append(alpha)
       }
+
+      // Update timing before capturing values to avoid one-frame lag
+      self.updateTime()
 
       // Capture needed values before async block
       let capturedMasks = masks
@@ -85,10 +87,11 @@ public class Segmenter: BasePredictor, @unchecked Sendable {
       let capturedT4 = self.t4
       let capturedLabels = self.labels
 
+      let capturedDetectedObjects = Array(limitedObjects)
       DispatchQueue.global(qos: .userInitiated).async { [weak self] in
         guard
           let processedMasks = generateCombinedMaskImage(
-            detectedObjects: detectedObjects,
+            detectedObjects: capturedDetectedObjects,
             protos: capturedMasks,
             inputWidth: capturedModelInputSize.width,
             inputHeight: capturedModelInputSize.height,
@@ -106,7 +109,6 @@ public class Segmenter: BasePredictor, @unchecked Sendable {
           orig_shape: capturedInputSize, boxes: capturedBoxes, masks: maskResults,
           speed: capturedT2,
           fps: 1 / capturedT4, names: capturedLabels)
-        self?.updateTime()
         self?.currentOnResultsListener?.on(result: result)
       }
     }
@@ -184,6 +186,7 @@ public class Segmenter: BasePredictor, @unchecked Sendable {
             width: box.width / modelWidth, height: box.height / modelHeight)
           let confidence = p.2
           let bestClass = p.1
+          guard bestClass < labels.count else { continue }
           let label = labels[bestClass]
           let xywh = VNImageRectForNormalizedRect(rect, inputWidth, inputHeight)
 
@@ -211,8 +214,7 @@ public class Segmenter: BasePredictor, @unchecked Sendable {
         let annotatedImage = drawYOLOSegmentationWithBoxes(
           ciImage: image,
           boxes: boxes,
-          maskImage: processedMasks.0,
-          originalImageSize: inputSize
+          maskImage: processedMasks.0
         )
 
         // 6. Construct result
@@ -245,9 +247,18 @@ public class Segmenter: BasePredictor, @unchecked Sendable {
     confidenceThreshold: Float,
     iouThreshold: Float
   ) -> [(CGRect, Int, Float, MLMultiArray)] {
+    let shape = feature.shape.map { $0.intValue }
+    guard shape.count == 3 else { return [] }
 
-    let numAnchors = feature.shape[2].intValue
-    let numFeatures = feature.shape[1].intValue
+    // YOLO26 end2end seg: [1, max_det, 6+32] where shape[2] < shape[1]
+    // Traditional seg: [1, 4+nc+32, num_anchors] where shape[2] > shape[1]
+    if shape[2] < shape[1] {
+      return postProcessEnd2EndSegment(
+        feature: feature, shape: shape, confidenceThreshold: confidenceThreshold)
+    }
+
+    let numAnchors = shape[2]
+    let numFeatures = shape[1]
     let boxFeatureLength = 4
     let maskConfidenceLength = 32
     let numClasses = numFeatures - boxFeatureLength - maskConfidenceLength
@@ -279,10 +290,6 @@ public class Segmenter: BasePredictor, @unchecked Sendable {
 
     let featurePointer = feature.dataPointer.assumingMemoryBound(to: Float.self)
     let pointerWrapper = FloatPointerWrapper(featurePointer)
-
-    // Pre-allocate reusable arrays outside the loop
-    let classProbs = UnsafeMutableBufferPointer<Float>.allocate(capacity: numClasses)
-    defer { classProbs.deallocate() }
 
     DispatchQueue.concurrentPerform(iterations: numAnchors) { j in
       let x = pointerWrapper.pointer[j]
@@ -368,6 +375,54 @@ public class Segmenter: BasePredictor, @unchecked Sendable {
     return selectedBoxesAndFeatures
   }
 
+  /// Processes YOLO26 end2end segmentation output: [1, max_det, 6+32].
+  /// Each detection: [x1, y1, x2, y2, conf, class_id, mask_0...mask_31] in xyxy pixel coords.
+  /// NMS is already applied by the model, so no additional NMS is needed.
+  private nonisolated func postProcessEnd2EndSegment(
+    feature: MLMultiArray,
+    shape: [Int],
+    confidenceThreshold: Float
+  ) -> [(CGRect, Int, Float, MLMultiArray)] {
+    let numDetections = shape[1]
+    let numFields = shape[2]
+    let maskCoefficients = 32
+    let strides = feature.strides.map { $0.intValue }
+    let pointer = feature.dataPointer.assumingMemoryBound(to: Float.self)
+    let detStride = strides[1]
+    let fieldStride = strides[2]
+
+    var results: [(CGRect, Int, Float, MLMultiArray)] = []
+
+    for i in 0..<numDetections {
+      let base = i * detStride
+      let conf = pointer[base + 4 * fieldStride]
+      guard conf > confidenceThreshold else { continue }
+
+      let x1 = CGFloat(pointer[base])
+      let y1 = CGFloat(pointer[base + fieldStride])
+      let x2 = CGFloat(pointer[base + 2 * fieldStride])
+      let y2 = CGFloat(pointer[base + 3 * fieldStride])
+      let classId = numFields > 5 ? Int(pointer[base + 5 * fieldStride]) : 0
+
+      let boundingBox = CGRect(x: x1, y: y1, width: x2 - x1, height: y2 - y1)
+
+      // Extract mask coefficients (fields 6..37)
+      guard
+        let maskProbs = try? MLMultiArray(
+          shape: [NSNumber(value: maskCoefficients)], dataType: .float32)
+      else { continue }
+      let maskProbsData = maskProbs.dataPointer.assumingMemoryBound(to: Float.self)
+      let maskStartField = numFields > 5 ? 6 : 5
+      for m in 0..<min(maskCoefficients, numFields - maskStartField) {
+        maskProbsData[m] = pointer[base + (maskStartField + m) * fieldStride]
+      }
+
+      results.append((boundingBox, classId, conf, maskProbs))
+    }
+
+    return results
+  }
+
   func checkShapeDimensions(of multiArray: MLMultiArray) -> Int {
     let shapeAsInts = multiArray.shape.map { $0.intValue }
     let dimensionCount = shapeAsInts.count
@@ -381,21 +436,5 @@ final class FloatPointerWrapper: @unchecked Sendable {
   let pointer: UnsafeMutablePointer<Float>
   init(_ pointer: UnsafeMutablePointer<Float>) {
     self.pointer = pointer
-  }
-}
-
-final class ResultsWrapper: @unchecked Sendable {
-  private var results: [(CGRect, Int, Float, MLMultiArray)] = []
-
-  func reserveCapacity(_ capacity: Int) {
-    results.reserveCapacity(capacity)
-  }
-
-  func append(_ result: (CGRect, Int, Float, MLMultiArray)) {
-    results.append(result)
-  }
-
-  func getResults() -> [(CGRect, Int, Float, MLMultiArray)] {
-    return results
   }
 }

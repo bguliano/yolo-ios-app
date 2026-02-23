@@ -17,13 +17,18 @@ import UIKit
 
 /// The primary interface for working with YOLO models, supporting multiple input types and inference methods.
 public class YOLO: @unchecked Sendable {
-  public var predictor: Predictor!
+  public var predictor: Predictor?
+
+  private var pendingNumItems: Int?
+  private var pendingConfidence: Double?
+  private var pendingIou: Double?
 
   /// Initialize YOLO with remote URL for automatic download and caching
   public init(url: URL, task: YOLOTask, completion: @escaping (Result<YOLO, Error>) -> Void) {
     let downloader = YOLOModelDownloader()
 
-    downloader.download(from: url, task: task) { result in
+    downloader.download(from: url, task: task) { [weak self] result in
+      guard let self = self else { return }
       switch result {
       case .success(let modelPath):
         self.loadModel(from: modelPath, task: task, completion: completion)
@@ -69,10 +74,17 @@ public class YOLO: @unchecked Sendable {
   private func loadModel(
     from modelURL: URL, task: YOLOTask, completion: ((Result<YOLO, Error>) -> Void)?
   ) {
-    let handleResult: (Result<BasePredictor, Error>) -> Void = { result in
+    let handleResult: (Result<BasePredictor, Error>) -> Void = { [weak self] result in
+      guard let self = self else { return }
       switch result {
       case .success(let predictor):
         self.predictor = predictor
+        self.pendingNumItems.map { predictor.setNumItemsThreshold(numItems: $0) }
+        self.pendingConfidence.map { predictor.setConfidenceThreshold(confidence: $0) }
+        self.pendingIou.map { predictor.setIouThreshold(iou: $0) }
+        self.pendingNumItems = nil
+        self.pendingConfidence = nil
+        self.pendingIou = nil
         completion?(.success(self))
       case .failure(let error):
         print("Failed to load model with error: \(error)")
@@ -100,13 +112,14 @@ public class YOLO: @unchecked Sendable {
   /// Sets the maximum number of detection items to include in results.
   /// - Parameter numItems: The maximum number of items to include (default is 30).
   public func setNumItemsThreshold(_ numItems: Int) {
+    pendingNumItems = numItems
     (predictor as? BasePredictor)?.setNumItemsThreshold(numItems: numItems)
   }
 
   /// Gets the current maximum number of detection items.
   /// - Returns: The current threshold value, or nil if not applicable.
   public func getNumItemsThreshold() -> Int? {
-    (predictor as? BasePredictor)?.numItemsThreshold
+    (predictor as? BasePredictor)?.numItemsThreshold ?? pendingNumItems
   }
 
   /// Sets the confidence threshold for filtering results.
@@ -116,13 +129,14 @@ public class YOLO: @unchecked Sendable {
       print("Warning: Confidence threshold should be between 0.0 and 1.0")
       return
     }
+    pendingConfidence = confidence
     (predictor as? BasePredictor)?.setConfidenceThreshold(confidence: confidence)
   }
 
   /// Gets the current confidence threshold.
-  /// - Returns: The current confidence threshold value, or nil if not applicable.
+  /// - Returns: The current threshold value, or nil if not applicable.
   public func getConfidenceThreshold() -> Double? {
-    (predictor as? BasePredictor)?.confidenceThreshold
+    (predictor as? BasePredictor)?.confidenceThreshold ?? pendingConfidence
   }
 
   /// Sets the IoU (Intersection over Union) threshold for non-maximum suppression.
@@ -132,13 +146,14 @@ public class YOLO: @unchecked Sendable {
       print("Warning: IoU threshold should be between 0.0 and 1.0")
       return
     }
+    pendingIou = iou
     (predictor as? BasePredictor)?.setIouThreshold(iou: iou)
   }
 
   /// Gets the current IoU threshold.
-  /// - Returns: The current IoU threshold value, or nil if not applicable.
+  /// - Returns: The current threshold value, or nil if not applicable.
   public func getIouThreshold() -> Double? {
-    (predictor as? BasePredictor)?.iouThreshold
+    (predictor as? BasePredictor)?.iouThreshold ?? pendingIou
   }
 
   /// Sets all thresholds at once.
@@ -152,39 +167,31 @@ public class YOLO: @unchecked Sendable {
     iou.map { setIouThreshold($0) }
   }
 
-  public func callAsFunction(_ uiImage: UIImage, returnAnnotatedImage: Bool = true) -> YOLOResult {
-    let ciImage = CIImage(image: uiImage)!
-    let result = predictor.predictOnImage(image: ciImage)
-    //        if returnAnnotatedImage {
-    //            let annotatedImage = drawYOLODetections(on: ciImage, result: result)
-    //            result.annotatedImage = annotatedImage
-    //        }
-    return result
+  public func callAsFunction(_ uiImage: UIImage) -> YOLOResult {
+    guard let ciImage = CIImage(image: uiImage), let predictor = predictor else {
+      return YOLOResult(orig_shape: .zero, boxes: [], speed: 0, names: [])
+    }
+    return predictor.predictOnImage(image: ciImage)
   }
 
-  public func callAsFunction(_ ciImage: CIImage, returnAnnotatedImage: Bool = true) -> YOLOResult {
-    let result = predictor.predictOnImage(image: ciImage)
-    //    if returnAnnotatedImage {
-    //      let annotatedImage = drawYOLODetections(on: ciImage, result: result)
-    //      result.annotatedImage = annotatedImage
-    //    }
-    return result
+  public func callAsFunction(_ ciImage: CIImage) -> YOLOResult {
+    guard let predictor = predictor else {
+      return YOLOResult(orig_shape: .zero, boxes: [], speed: 0, names: [])
+    }
+    return predictor.predictOnImage(image: ciImage)
   }
 
-  public func callAsFunction(_ cgImage: CGImage, returnAnnotatedImage: Bool = true) -> YOLOResult {
+  public func callAsFunction(_ cgImage: CGImage) -> YOLOResult {
+    guard let predictor = predictor else {
+      return YOLOResult(orig_shape: .zero, boxes: [], speed: 0, names: [])
+    }
     let ciImage = CIImage(cgImage: cgImage)
-    let result = predictor.predictOnImage(image: ciImage)
-    //    if returnAnnotatedImage {
-    //      let annotatedImage = drawYOLODetections(on: ciImage, result: result)
-    //      result.annotatedImage = annotatedImage
-    //    }
-    return result
+    return predictor.predictOnImage(image: ciImage)
   }
 
   public func callAsFunction(
     _ resourceName: String,
-    withExtension ext: String? = nil,
-    returnAnnotatedImage: Bool = true
+    withExtension ext: String? = nil
   ) -> YOLOResult {
     guard let url = Bundle.main.url(forResource: resourceName, withExtension: ext),
       let data = try? Data(contentsOf: url),
@@ -192,12 +199,11 @@ public class YOLO: @unchecked Sendable {
     else {
       return YOLOResult(orig_shape: .zero, boxes: [], speed: 0, names: [])
     }
-    return self(uiImage, returnAnnotatedImage: returnAnnotatedImage)
+    return self(uiImage)
   }
 
   public func callAsFunction(
-    _ remoteURL: URL?,
-    returnAnnotatedImage: Bool = true
+    _ remoteURL: URL?
   ) -> YOLOResult {
     guard let remoteURL = remoteURL,
       let data = try? Data(contentsOf: remoteURL),
@@ -205,12 +211,11 @@ public class YOLO: @unchecked Sendable {
     else {
       return YOLOResult(orig_shape: .zero, boxes: [], speed: 0, names: [])
     }
-    return self(uiImage, returnAnnotatedImage: returnAnnotatedImage)
+    return self(uiImage)
   }
 
   public func callAsFunction(
-    _ localPath: String,
-    returnAnnotatedImage: Bool = true
+    _ localPath: String
   ) -> YOLOResult {
     let fileURL = URL(fileURLWithPath: localPath)
     guard let data = try? Data(contentsOf: fileURL),
@@ -218,18 +223,17 @@ public class YOLO: @unchecked Sendable {
     else {
       return YOLOResult(orig_shape: .zero, boxes: [], speed: 0, names: [])
     }
-    return self(uiImage, returnAnnotatedImage: returnAnnotatedImage)
+    return self(uiImage)
   }
 
   @MainActor @available(iOS 16.0, *)
   public func callAsFunction(
-    _ swiftUIImage: SwiftUI.Image,
-    returnAnnotatedImage: Bool = true
+    _ swiftUIImage: SwiftUI.Image
   ) -> YOLOResult {
     let renderer = ImageRenderer(content: swiftUIImage)
     guard let uiImage = renderer.uiImage else {
       return YOLOResult(orig_shape: .zero, boxes: [], speed: 0, names: [])
     }
-    return self(uiImage, returnAnnotatedImage: returnAnnotatedImage)
+    return self(uiImage)
   }
 }

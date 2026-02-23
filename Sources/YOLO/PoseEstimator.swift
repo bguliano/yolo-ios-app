@@ -13,13 +13,13 @@
 //  on the source image to show the detected pose skeleton.
 
 import Accelerate
+import CoreML
 import Foundation
 import UIKit
 import Vision
 
 /// Specialized predictor for YOLO pose estimation models that identify human body keypoints.
 public class PoseEstimator: BasePredictor, @unchecked Sendable {
-  var colorsForMask: [(red: UInt8, green: UInt8, blue: UInt8)] = []
 
   override func processObservations(for request: VNRequest, error: Error?) {
     if let results = request.results as? [VNCoreMLFeatureValueObservation] {
@@ -37,11 +37,11 @@ public class PoseEstimator: BasePredictor, @unchecked Sendable {
           boxes.append(person.box)
           keypointsList.append(person.keypoints)
         }
+        self.updateTime()
         let result = YOLOResult(
           orig_shape: inputSize, boxes: boxes, masks: nil, probs: nil, keypointsList: keypointsList,
-          annotatedImage: nil, speed: 0, fps: 0, originalImage: nil, names: labels)
+          annotatedImage: nil, speed: self.t2, fps: 1 / self.t4, names: labels)
         self.currentOnResultsListener?.on(result: result)
-        self.updateTime()
       }
     }
   }
@@ -97,15 +97,14 @@ public class PoseEstimator: BasePredictor, @unchecked Sendable {
             ciImage: image,
             keypointsList: keypointsForImage,
             confsList: confsList,
-            boundingBoxes: boxes,
-            originalImageSize: inputSize
+            boundingBoxes: boxes
           )
 
+          updateTime()
           let result = YOLOResult(
             orig_shape: inputSize, boxes: boxes, masks: nil, probs: nil,
             keypointsList: keypointsList, annotatedImage: annotatedImage, speed: self.t2,
-            fps: 1 / self.t4, originalImage: nil, names: labels)
-          updateTime()
+            fps: 1 / self.t4, names: labels)
           return result
         }
       }
@@ -122,8 +121,18 @@ public class PoseEstimator: BasePredictor, @unchecked Sendable {
   )
     -> [(box: Box, keypoints: Keypoints)]
   {
-    let numAnchors = prediction.shape[2].intValue
-    let featureCount = prediction.shape[1].intValue - 5
+    let shape = prediction.shape.map { $0.intValue }
+    guard shape.count == 3 else { return [] }
+
+    // YOLO26 end2end pose: [1, max_det, 6+51] where shape[2] < shape[1]
+    // Traditional pose: [1, 56, num_anchors] where shape[2] > shape[1]
+    if shape[2] < shape[1] {
+      return postProcessEnd2EndPose(
+        prediction: prediction, shape: shape, confidenceThreshold: confidenceThreshold)
+    }
+
+    let numAnchors = shape[2]
+    let featureCount = shape[1] - 5
 
     var boxes = [CGRect]()
     var scores = [Float]()
@@ -238,6 +247,84 @@ public class PoseEstimator: BasePredictor, @unchecked Sendable {
 
       let keypoints = Keypoints(xyn: xynArray, xy: xyArray, conf: confArray)
       return (boxResult, keypoints)
+    }
+
+    return results
+  }
+
+  /// Processes YOLO26 end2end pose output: [1, max_det, 6+51].
+  /// Each detection: [x1, y1, x2, y2, conf, class_id, kp0_x, kp0_y, kp0_conf, ...] in xyxy pixel coords.
+  /// NMS is already applied by the model.
+  private func postProcessEnd2EndPose(
+    prediction: MLMultiArray,
+    shape: [Int],
+    confidenceThreshold: Float
+  ) -> [(box: Box, keypoints: Keypoints)] {
+    let numDetections = shape[1]
+    let numFields = shape[2]
+    let strides = prediction.strides.map { $0.intValue }
+    let pointer = prediction.dataPointer.assumingMemoryBound(to: Float.self)
+    let detStride = strides[1]
+    let fieldStride = strides[2]
+
+    // Determine keypoint start field: check if class_id field is present
+    let kpStartField: Int
+    if (numFields - 6) % 3 == 0 {
+      kpStartField = 6  // [x1, y1, x2, y2, conf, class_id, kp...]
+    } else {
+      kpStartField = 5  // [x1, y1, x2, y2, conf, kp...]
+    }
+    let numKeypoints = (numFields - kpStartField) / 3
+
+    var results: [(box: Box, keypoints: Keypoints)] = []
+
+    for i in 0..<numDetections {
+      let base = i * detStride
+      let conf = pointer[base + 4 * fieldStride]
+      guard conf > confidenceThreshold else { continue }
+
+      let x1 = CGFloat(pointer[base])
+      let y1 = CGFloat(pointer[base + fieldStride])
+      let x2 = CGFloat(pointer[base + 2 * fieldStride])
+      let y2 = CGFloat(pointer[base + 3 * fieldStride])
+
+      // Convert xyxy to normalized and image coordinates
+      let Nx = x1 / CGFloat(modelInputSize.width)
+      let Ny = y1 / CGFloat(modelInputSize.height)
+      let Nw = (x2 - x1) / CGFloat(modelInputSize.width)
+      let Nh = (y2 - y1) / CGFloat(modelInputSize.height)
+      let ix = Nx * inputSize.width
+      let iy = Ny * inputSize.height
+      let iw = Nw * inputSize.width
+      let ih = Nh * inputSize.height
+      let normalizedBox = CGRect(x: Nx, y: Ny, width: Nw, height: Nh)
+      let imageSizeBox = CGRect(x: ix, y: iy, width: iw, height: ih)
+      let boxResult = Box(
+        index: 0, cls: "person", conf: conf, xywh: imageSizeBox, xywhn: normalizedBox)
+
+      // Extract keypoints
+      var xynArray = [(x: Float, y: Float)]()
+      var xyArray = [(x: Float, y: Float)]()
+      var confArray = [Float]()
+
+      for k in 0..<numKeypoints {
+        let kx = pointer[base + (kpStartField + 3 * k) * fieldStride]
+        let ky = pointer[base + (kpStartField + 3 * k + 1) * fieldStride]
+        let kc = pointer[base + (kpStartField + 3 * k + 2) * fieldStride]
+
+        let nX = kx / Float(modelInputSize.width)
+        let nY = ky / Float(modelInputSize.height)
+        xynArray.append((x: nX, y: nY))
+
+        let x = nX * Float(inputSize.width)
+        let y = nY * Float(inputSize.height)
+        xyArray.append((x: x, y: y))
+
+        confArray.append(kc)
+      }
+
+      let keypoints = Keypoints(xyn: xynArray, xy: xyArray, conf: confArray)
+      results.append((boxResult, keypoints))
     }
 
     return results
